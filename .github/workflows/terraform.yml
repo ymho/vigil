@@ -1,0 +1,21 @@
+name: terraform-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt
+        run: terraform -chdir=infra fmt -check -recursive
+      - name: Terraform init
+        run: terraform -chdir=infra init -backend=false
+      - name: Terraform validate
+        run: terraform -chdir=infra validate
+      - name: Python unit tests
+        run: python3 -m unittest discover -s agent/tests -v

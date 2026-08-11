@@ -1,0 +1,106 @@
+#!/bin/bash
+set -euo pipefail
+
+mkdir -p /opt/vigil
+
+cat >/etc/vigil.env <<'ENVEOF'
+VIGIL_BUCKET=${artifact_bucket}
+VIGIL_BUNDLE_KEY=${bundle_object_key}
+VIGIL_MODEL=${model_name}
+ENVEOF
+chmod 600 /etc/vigil.env
+
+cat >/usr/local/bin/vigil-bootstrap <<'BOOTEOF'
+#!/bin/bash
+set -euo pipefail
+source /etc/vigil.env
+
+BUNDLE=/tmp/vigil-bundle.tar.gz
+STAGE=/tmp/vigil-stage
+
+rm -rf "$STAGE"
+mkdir -p "$STAGE" /opt/vigil/repo /var/lib/vigil/ollama-models
+
+printf '[1/6] Downloading offline bundle from S3...\n'
+aws s3 cp "s3://$VIGIL_BUCKET/$VIGIL_BUNDLE_KEY" "$BUNDLE"
+
+tar -xzf "$BUNDLE" -C "$STAGE"
+
+printf '[2/6] Installing Ollama runtime...\n'
+cp -a "$STAGE/ollama-root/." /usr/
+
+if ! id ollama >/dev/null 2>&1; then
+  useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+fi
+chown -R ollama:ollama /var/lib/vigil/ollama-models
+
+cat >/etc/systemd/system/ollama.service <<'SERVICEEOF'
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="OLLAMA_MODELS=/var/lib/vigil/ollama-models"
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+systemctl daemon-reload
+systemctl enable --now ollama
+
+printf '[3/6] Installing repository files...\n'
+rm -rf /opt/vigil/repo
+cp -a "$STAGE/repo" /opt/vigil/repo
+
+printf '[4/6] Importing GGUF into Ollama...\n'
+cat >/opt/vigil/Modelfile <<MODELEOF
+FROM $STAGE/model/model.gguf
+PARAMETER temperature 0.2
+PARAMETER num_ctx 8192
+SYSTEM You are VIGIL, a careful infrastructure investigation agent. Use tools when facts are available from the environment. Never claim a fact you did not verify. Answer in Japanese unless asked otherwise.
+MODELEOF
+
+# Wait for the local Ollama API.
+for i in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+OLLAMA_MODELS=/var/lib/vigil/ollama-models ollama create "$VIGIL_MODEL" -f /opt/vigil/Modelfile
+
+printf '[5/6] Installing Agent launcher...\n'
+mkdir -p /opt/vigil/bin
+cat >/opt/vigil/bin/vigil-agent <<'LAUNCHEOF'
+#!/bin/bash
+set -euo pipefail
+source /etc/vigil.env
+cd /opt/vigil/repo
+exec /usr/bin/python3 agent/agent.py --model "$VIGIL_MODEL" "$@"
+LAUNCHEOF
+chmod +x /opt/vigil/bin/vigil-agent
+
+printf '[6/6] Complete.\n'
+/opt/vigil/bin/vigil-agent --help || true
+BOOTEOF
+
+chmod +x /usr/local/bin/vigil-bootstrap
+
+cat >/etc/motd <<'EOF2'
+VIGIL private LLM host
+
+Bootstrap after uploading the offline bundle:
+  sudo /usr/local/bin/vigil-bootstrap
+
+Run:
+  cd /opt/vigil/repo
+  /opt/vigil/bin/vigil-agent "この環境の閉域性を調査してください"
+EOF2
