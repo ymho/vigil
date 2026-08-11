@@ -1,138 +1,210 @@
 from __future__ import annotations
 
-import fnmatch
-import os
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
-
-MAX_FILE_CHARS = 30_000
-MAX_RESULTS = 200
+from typing import Callable
 
 
-def workspace_root() -> Path:
-    return Path(os.environ.get("VIGIL_WORKSPACE", os.getcwd())).resolve()
+class Workspace:
+    """Toolがアクセスできる範囲をworkspace配下に制限する。"""
+
+    def __init__(self, root: str):
+        self.root = Path(root).resolve()
+
+        if not self.root.exists():
+            raise ValueError(f"Workspace does not exist: {self.root}")
+
+    def resolve(self, relative_path: str) -> Path:
+        target = (self.root / relative_path).resolve()
+
+        if target == self.root:
+            return target
+
+        if self.root not in target.parents:
+            raise ValueError(
+                f"Access outside workspace denied: {relative_path}"
+            )
+
+        return target
 
 
-def _safe_path(path: str) -> Path:
-    root = workspace_root()
-    candidate = (root / path).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise ValueError(f"Access denied outside workspace: {path}")
-    return candidate
+class Tools:
+    """VIGIL Agentが利用できるTool群。"""
 
+    def __init__(self, workspace: Workspace):
+        self.workspace = workspace
 
-def list_files(pattern: str = "*.tf") -> str:
-    """List files recursively in the workspace matching a glob-like pattern."""
-    root = workspace_root()
-    matches: list[str] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        rel = str(p.relative_to(root))
-        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(p.name, pattern):
-            matches.append(rel)
-            if len(matches) >= MAX_RESULTS:
-                break
-    return "\n".join(matches) if matches else "0 matches"
+    def list_files(self, pattern: str = "*.tf") -> str:
+        """List files in the workspace matching a glob pattern."""
 
-
-def read_file(path: str) -> str:
-    """Read a UTF-8 text file from the workspace."""
-    target = _safe_path(path)
-    if not target.is_file():
-        return f"Not a file: {path}"
-    try:
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return f"Binary or non-UTF-8 file: {path}"
-    if len(text) > MAX_FILE_CHARS:
-        return text[:MAX_FILE_CHARS] + f"\n...[truncated at {MAX_FILE_CHARS} chars]"
-    return text
-
-
-def grep(pattern: str, file_glob: str = "*.tf") -> str:
-    """Search text files in the workspace for a literal, case-insensitive string."""
-    root = workspace_root()
-    needle = pattern.lower()
-    results: list[str] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        rel = str(p.relative_to(root))
-        if not (fnmatch.fnmatch(rel, file_glob) or fnmatch.fnmatch(p.name, file_glob)):
-            continue
-        try:
-            lines = p.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
-            continue
-        for line_no, line in enumerate(lines, start=1):
-            if needle in line.lower():
-                results.append(f"{rel}:{line_no}: {line.strip()}")
-                if len(results) >= MAX_RESULTS:
-                    return "\n".join(results)
-    return "\n".join(results) if results else "0 matches"
-
-
-def check_internet(host: str = "example.com", port: int = 443, timeout_seconds: int = 3) -> str:
-    """Test whether this host can establish a TCP connection to a public Internet host."""
-    try:
-        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        return f"DNS/resolve failed for {host}: {exc}"
-
-    errors: list[str] = []
-    for family, socktype, proto, _, sockaddr in addresses[:4]:
-        sock = socket.socket(family, socktype, proto)
-        sock.settimeout(timeout_seconds)
-        try:
-            sock.connect(sockaddr)
-            return f"CONNECTED to public host {host}:{port} via {sockaddr}. Internet egress appears available."
-        except OSError as exc:
-            errors.append(f"{sockaddr}: {exc}")
-        finally:
-            sock.close()
-    return "Unable to connect to public Internet host. Attempts: " + " | ".join(errors)
-
-
-def check_s3(bucket: str = "") -> str:
-    """Verify access to the controlled S3 artifact bucket using the EC2 instance role."""
-    bucket = bucket or os.environ.get("VIGIL_BUCKET", "")
-    if not bucket:
-        return "VIGIL_BUCKET is not set and no bucket argument was supplied."
-    try:
-        proc = subprocess.run(
-            ["aws", "s3", "ls", f"s3://{bucket}"],
-            text=True,
-            capture_output=True,
-            timeout=15,
-            check=False,
+        files = sorted(
+            p
+            for p in self.workspace.root.rglob(pattern)
+            if p.is_file()
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"S3 check failed to execute: {exc}"
-    combined = (proc.stdout + proc.stderr).strip()
-    return f"exit_code={proc.returncode}\n{combined or '(no output)'}"
+
+        if not files:
+            return "0 files"
+
+        return "\n".join(
+            str(p.relative_to(self.workspace.root))
+            for p in files
+        )
+
+    def read_file(self, path: str) -> str:
+        """Read a text file from the workspace."""
+
+        target = self.workspace.resolve(path)
+
+        if not target.is_file():
+            return f"File not found: {path}"
+
+        try:
+            text = target.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+        # LLMへ巨大なファイルを丸ごと渡さない
+        max_chars = 30_000
+
+        if len(text) > max_chars:
+            return text[:max_chars] + "\n\n[TRUNCATED]"
+
+        return text
+
+    def grep(
+        self,
+        pattern: str,
+        glob: str = "*.tf",
+    ) -> str:
+        """Search workspace files for a string."""
+
+        results: list[str] = []
+
+        for path in sorted(self.workspace.root.rglob(glob)):
+            if not path.is_file():
+                continue
+
+            try:
+                lines = path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
+            except Exception:
+                continue
+
+            for lineno, line in enumerate(lines, 1):
+                if pattern.lower() not in line.lower():
+                    continue
+
+                relative = path.relative_to(self.workspace.root)
+
+                results.append(
+                    f"{relative}:{lineno}: {line.strip()}"
+                )
+
+                if len(results) >= 100:
+                    results.append("[TRUNCATED: 100 matches]")
+                    return "\n".join(results)
+
+        return "\n".join(results) or "0 matches"
+
+    def check_internet(
+        self,
+        host: str = "1.1.1.1",
+        port: int = 443,
+        timeout: int = 5,
+    ) -> str:
+        """
+        Test actual outbound Internet connectivity.
+
+        DNSを使わずInternet側IPへ直接TCP接続することで、
+        名前解決失敗とInternet到達不能を切り分ける。
+        """
+
+        try:
+            with socket.create_connection(
+                (host, int(port)),
+                timeout=int(timeout),
+            ):
+                return f"CONNECTED: {host}:{port}"
+
+        except Exception as exc:
+            return (
+                f"UNREACHABLE: {host}:{port} "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    def check_s3(self, bucket: str) -> str:
+        """
+        Verify access to the VIGIL S3 bucket.
+
+        全Bucket一覧ではなく、指定Bucketへのアクセスだけを確認する。
+        """
+
+        try:
+            proc = subprocess.run(
+                [
+                    "aws",
+                    "s3",
+                    "ls",
+                    f"s3://{bucket}/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception as exc:
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+        output = (
+            proc.stdout.strip()
+            or proc.stderr.strip()
+            or "(no output)"
+        )
+
+        return (
+            f"exit_code={proc.returncode}\n"
+            f"{output}"
+        )
+
+    def registry(self) -> dict[str, Callable]:
+        """Agent Runtimeから呼び出すTool一覧。"""
+
+        return {
+            "list_files": self.list_files,
+            "read_file": self.read_file,
+            "grep": self.grep,
+            "check_internet": self.check_internet,
+            "check_s3": self.check_s3,
+        }
 
 
-TOOLS: dict[str, Callable[..., str]] = {
-    "list_files": list_files,
-    "read_file": read_file,
-    "grep": grep,
-    "check_internet": check_internet,
-    "check_s3": check_s3,
-}
-
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+#
+# LLMへ渡す「Toolの説明書」
+#
+TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files recursively in the workspace. Use this before reading files when filenames are unknown.",
+            "description": (
+                "Workspace内のファイルを検索する。"
+                "Terraformファイルの所在が分からない場合は"
+                "最初にこのToolを使う。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Glob-like pattern such as *.tf or infra/*.tf"}
+                    "pattern": {
+                        "type": "string",
+                        "description": "例: *.tf",
+                    }
                 },
             },
         },
@@ -141,12 +213,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file inside the workspace.",
+            "description": (
+                "Workspace内の指定ファイルを読み取る。"
+            ),
             "parameters": {
                 "type": "object",
                 "required": ["path"],
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to workspace root"}
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Workspaceからの相対パス"
+                        ),
+                    }
                 },
             },
         },
@@ -155,13 +234,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search workspace text files for a literal case-insensitive string. Useful for Terraform resource names and settings.",
+            "description": (
+                "Workspace内のファイルから文字列を検索する。"
+                "Terraformのresourceや設定を探す場合に使う。"
+            ),
             "parameters": {
                 "type": "object",
                 "required": ["pattern"],
                 "properties": {
-                    "pattern": {"type": "string"},
-                    "file_glob": {"type": "string", "description": "File filter; default *.tf"},
+                    "pattern": {
+                        "type": "string",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "例: *.tf",
+                    },
                 },
             },
         },
@@ -170,13 +257,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "check_internet",
-            "description": "Perform a runtime TCP connectivity check to a public Internet host. Use this to test actual egress, not just Terraform intent.",
+            "description": (
+                "EC2からInternet側IPへのTCP接続を試し、"
+                "実際のInternet到達性を確認する。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "host": {"type": "string", "description": "Public hostname; default example.com"},
-                    "port": {"type": "integer", "description": "TCP port; default 443"},
-                    "timeout_seconds": {"type": "integer", "description": "Connection timeout; default 3"},
+                    "host": {
+                        "type": "string",
+                        "description": "既定値: 1.1.1.1",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "既定値: 443",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "既定値: 5秒",
+                    },
                 },
             },
         },
@@ -185,11 +284,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "check_s3",
-            "description": "Check access to the controlled artifact S3 bucket with the instance role. This demonstrates approved AWS connectivity remains available.",
+            "description": (
+                "指定したS3 Bucketへ、EC2のIAM Roleと"
+                "VPC Endpoint経由でアクセスできるか確認する。"
+            ),
             "parameters": {
                 "type": "object",
+                "required": ["bucket"],
                 "properties": {
-                    "bucket": {"type": "string", "description": "Bucket name; usually omit to use VIGIL_BUCKET"}
+                    "bucket": {
+                        "type": "string",
+                    }
                 },
             },
         },
