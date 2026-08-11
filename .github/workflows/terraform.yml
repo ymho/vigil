@@ -18,4 +18,5 @@ jobs:
       - name: Terraform validate
         run: terraform -chdir=infra validate
       - name: Python unit tests
-        run: python3 -m unittest discover -s agent/tests -v
+        run: |
+          PYTHONPATH=agent python3 -m unittest discover -s agent/tests -v

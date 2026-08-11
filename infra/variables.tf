@@ -40,10 +40,22 @@ variable "root_volume_size_gib" {
   default     = 100
 }
 
-variable "bundle_object_key" {
-  description = "S3 object key containing the offline bundle"
+variable "runtime_object_key" {
+  description = "S3 object key containing the Ollama runtime"
   type        = string
-  default     = "bootstrap/vigil-bundle.tar.gz"
+  default     = "runtime/ollama-root.tar.gz"
+}
+
+variable "model_object_key" {
+  description = "S3 object key containing the GGUF model"
+  type        = string
+  default     = "runtime/model.gguf"
+}
+
+variable "app_object_key" {
+  description = "S3 object key containing the VIGIL application"
+  type        = string
+  default     = "app/vigil-app.tar.gz"
 }
 
 variable "model_name" {

@@ -18,9 +18,11 @@ resource "aws_instance" "agent" {
   }
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    artifact_bucket   = aws_s3_bucket.artifacts.bucket
-    bundle_object_key = var.bundle_object_key
-    model_name        = var.model_name
+    artifact_bucket    = aws_s3_bucket.artifacts.bucket
+    runtime_object_key = var.runtime_object_key
+    model_object_key   = var.model_object_key
+    app_object_key     = var.app_object_key
+    model_name         = var.model_name
   })
 
   tags = {

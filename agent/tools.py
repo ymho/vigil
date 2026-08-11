@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
 from pathlib import Path
@@ -81,7 +82,12 @@ class Tools:
         pattern: str,
         glob: str = "*.tf",
     ) -> str:
-        """Search workspace files for a string."""
+        """Search workspace files using a regular expression."""
+
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return f"ERROR: invalid regex: {exc}"
 
         results: list[str] = []
 
@@ -98,7 +104,7 @@ class Tools:
                 continue
 
             for lineno, line in enumerate(lines, 1):
-                if pattern.lower() not in line.lower():
+                if not regex.search(line):
                     continue
 
                 relative = path.relative_to(self.workspace.root)

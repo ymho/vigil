@@ -266,6 +266,29 @@ resource "aws_instance" "agent" {
         for tool in registry.values():
             self.assertTrue(callable(tool))
 
+    def test_grep_regex_or(self):
+        result = self.tools.grep(
+            "aws_vpc|internet_gateway",
+            "*.tf",
+        )
+
+        self.assertIn("network.tf:", result)
+        self.assertIn(
+            'resource "aws_vpc"',
+            result,
+        )
+
+    def test_grep_invalid_regex(self):
+        result = self.tools.grep(
+            "[invalid",
+            "*.tf",
+        )
+
+        self.assertIn(
+            "ERROR: invalid regex",
+            result,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

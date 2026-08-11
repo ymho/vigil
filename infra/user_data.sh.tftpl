@@ -3,39 +3,173 @@ set -euo pipefail
 
 mkdir -p /opt/vigil
 
+# ============================================================
+# VIGIL configuration
+# ============================================================
+
 cat >/etc/vigil.env <<'ENVEOF'
 VIGIL_BUCKET=${artifact_bucket}
-VIGIL_BUNDLE_KEY=${bundle_object_key}
+VIGIL_RUNTIME_KEY=${runtime_object_key}
+VIGIL_MODEL_KEY=${model_object_key}
+VIGIL_APP_KEY=${app_object_key}
 VIGIL_MODEL=${model_name}
 ENVEOF
-chmod 600 /etc/vigil.env
+
+# Bucket / object key / model name only. No secrets are stored here.
+chmod 644 /etc/vigil.env
+
+
+# ============================================================
+# App updater
+#
+# Agent / Tools / Terraform workspace only.
+# Runtime and model are not downloaded again.
+# ============================================================
+
+cat >/usr/local/bin/vigil-update-app <<'UPDATEEOF'
+#!/bin/bash
+set -euo pipefail
+
+source /etc/vigil.env
+
+WORK_DIR=/opt/vigil/update
+APP_BUNDLE="$WORK_DIR/vigil-app.tar.gz"
+STAGE="$WORK_DIR/stage"
+
+printf '[1/4] Preparing application update...\n'
+
+rm -rf "$WORK_DIR"
+mkdir -p "$STAGE"
+
+
+printf '[2/4] Downloading VIGIL application from S3...\n'
+
+aws s3 cp \
+  "s3://$VIGIL_BUCKET/$VIGIL_APP_KEY" \
+  "$APP_BUNDLE"
+
+
+printf '[3/4] Extracting application...\n'
+
+tar -xzf "$APP_BUNDLE" -C "$STAGE"
+
+if [ ! -f "$STAGE/agent/agent.py" ]; then
+  echo 'ERROR: agent/agent.py was not found in the application bundle.' >&2
+  exit 1
+fi
+
+if [ ! -f "$STAGE/agent/tools.py" ]; then
+  echo 'ERROR: agent/tools.py was not found in the application bundle.' >&2
+  exit 1
+fi
+
+if [ ! -d "$STAGE/infra" ]; then
+  echo 'ERROR: infra/ was not found in the application bundle.' >&2
+  exit 1
+fi
+
+
+printf '[4/4] Installing application...\n'
+
+rm -rf /opt/vigil/repo
+mkdir -p /opt/vigil/repo
+
+cp -a "$STAGE/." /opt/vigil/repo/
+
+rm -rf "$WORK_DIR"
+
+printf 'Application update complete.\n'
+UPDATEEOF
+
+chmod +x /usr/local/bin/vigil-update-app
+
+
+# ============================================================
+# Bootstrap
+#
+# Initial installation:
+#   1. Ollama runtime
+#   2. GGUF model
+#   3. Ollama service
+#   4. Model import
+#   5. Agent application
+# ============================================================
 
 cat >/usr/local/bin/vigil-bootstrap <<'BOOTEOF'
 #!/bin/bash
 set -euo pipefail
+
 source /etc/vigil.env
 
 WORK_DIR=/opt/vigil/bootstrap
-BUNDLE="$WORK_DIR/vigil-bundle.tar.gz"
-STAGE="$WORK_DIR/stage"
+RUNTIME_BUNDLE="$WORK_DIR/ollama-root.tar.gz"
+MODEL_FILE="$WORK_DIR/model.gguf"
+RUNTIME_STAGE="$WORK_DIR/runtime"
 
 rm -rf "$WORK_DIR"
+
 mkdir -p \
-  "$STAGE" \
-  /opt/vigil/repo \
+  "$RUNTIME_STAGE" \
+  /opt/vigil/bin \
   /var/lib/vigil/ollama-models
 
-printf '[1/6] Downloading offline bundle from S3...\n'
-aws s3 cp "s3://$VIGIL_BUCKET/$VIGIL_BUNDLE_KEY" "$BUNDLE"
 
-tar -xzf "$BUNDLE" -C "$STAGE"
+# ------------------------------------------------------------
+# 1. Download artifacts
+# ------------------------------------------------------------
 
-printf '[2/6] Installing Ollama runtime...\n'
-cp -a "$STAGE/ollama-root/." /usr/
+printf '[1/7] Downloading Ollama runtime from S3...\n'
+
+aws s3 cp \
+  "s3://$VIGIL_BUCKET/$VIGIL_RUNTIME_KEY" \
+  "$RUNTIME_BUNDLE"
+
+
+printf '[2/7] Downloading GGUF model from S3...\n'
+
+aws s3 cp \
+  "s3://$VIGIL_BUCKET/$VIGIL_MODEL_KEY" \
+  "$MODEL_FILE"
+
+
+# ------------------------------------------------------------
+# 2. Install Ollama
+# ------------------------------------------------------------
+
+printf '[3/7] Installing Ollama runtime...\n'
+
+tar -xzf "$RUNTIME_BUNDLE" -C "$RUNTIME_STAGE"
+
+if [ ! -d "$RUNTIME_STAGE/ollama-root" ]; then
+  echo 'ERROR: ollama-root was not found in runtime artifact.' >&2
+  exit 1
+fi
+
+cp -a "$RUNTIME_STAGE/ollama-root/." /usr/
+
+if [ ! -x /usr/bin/ollama ]; then
+  echo 'ERROR: /usr/bin/ollama was not installed.' >&2
+  exit 1
+fi
+
+
+# ------------------------------------------------------------
+# 3. Ollama service
+# ------------------------------------------------------------
+
+printf '[4/7] Configuring Ollama service...\n'
 
 if ! id ollama >/dev/null 2>&1; then
-  useradd -r -s /bin/false -U -m -d /usr/share/ollama ollama
+  useradd \
+    -r \
+    -s /bin/false \
+    -U \
+    -m \
+    -d /usr/share/ollama \
+    ollama
 fi
+
+mkdir -p /var/lib/vigil/ollama-models
 chown -R ollama:ollama /var/lib/vigil/ollama-models
 
 cat >/etc/systemd/system/ollama.service <<'SERVICEEOF'
@@ -59,57 +193,115 @@ SERVICEEOF
 systemctl daemon-reload
 systemctl enable --now ollama
 
-printf '[3/6] Installing repository files...\n'
-rm -rf /opt/vigil/repo
-cp -a "$STAGE/repo" /opt/vigil/repo
-
-printf '[4/6] Importing GGUF into Ollama...\n'
-cat >/opt/vigil/Modelfile <<MODELEOF
-FROM $STAGE/model/model.gguf
-PARAMETER temperature 0.2
-PARAMETER num_ctx 8192
-SYSTEM You are VIGIL, a careful infrastructure investigation agent. Use tools when facts are available from the environment. Never claim a fact you did not verify. Answer in Japanese unless asked otherwise.
-MODELEOF
 
 # Wait for the local Ollama API.
-for i in $(seq 1 30); do
-  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+OLLAMA_READY=0
+
+for i in $(seq 1 60); do
+  if curl -fsS \
+    http://127.0.0.1:11434/api/tags \
+    >/dev/null 2>&1; then
+
+    OLLAMA_READY=1
     break
   fi
+
   sleep 1
 done
 
-OLLAMA_MODELS=/var/lib/vigil/ollama-models ollama create "$VIGIL_MODEL" -f /opt/vigil/Modelfile
+if [ "$OLLAMA_READY" -ne 1 ]; then
+  echo 'ERROR: Ollama API did not become ready.' >&2
+  systemctl status ollama --no-pager || true
+  exit 1
+fi
 
-printf '[5/6] Installing Agent launcher...\n'
-mkdir -p /opt/vigil/bin
-cat >/opt/vigil/bin/vigil-agent <<'LAUNCHEOF'
+
+# ------------------------------------------------------------
+# 4. Import model
+# ------------------------------------------------------------
+
+printf '[5/7] Importing GGUF model into Ollama...\n'
+
+cat >/opt/vigil/Modelfile <<MODELEOF
+FROM $MODEL_FILE
+
+PARAMETER temperature 0.2
+PARAMETER num_ctx 8192
+
+SYSTEM You are VIGIL, a careful infrastructure investigation agent. Use tools when facts are available from the environment. Never claim a fact you did not verify. Answer in Japanese unless asked otherwise.
+MODELEOF
+
+ollama create \
+  "$VIGIL_MODEL" \
+  -f /opt/vigil/Modelfile
+
+
+# ------------------------------------------------------------
+# 5. Install application
+# ------------------------------------------------------------
+
+printf '[6/7] Installing VIGIL application...\n'
+
+/usr/local/bin/vigil-update-app
+
+
+# ------------------------------------------------------------
+# 6. Agent launcher
+# ------------------------------------------------------------
+
+cat >/opt/vigil/bin/vigil-agent <<'LAUNCHEREOF'
 #!/bin/bash
 set -euo pipefail
+
 source /etc/vigil.env
+
 cd /opt/vigil/repo
-exec /usr/bin/python3 agent/agent.py --model "$VIGIL_MODEL" "$@"
-LAUNCHEOF
+
+exec /usr/bin/python3 \
+  agent/agent.py \
+  --model "$VIGIL_MODEL" \
+  "$@"
+LAUNCHEREOF
+
 chmod +x /opt/vigil/bin/vigil-agent
 
-printf '[6/6] Cleaning bootstrap files...\n'
+
+# ------------------------------------------------------------
+# 7. Cleanup
+# ------------------------------------------------------------
+
+printf '[7/7] Cleaning bootstrap files...\n'
+
 rm -rf "$WORK_DIR"
 
-printf 'Complete.\n'
+printf '\nVIGIL bootstrap complete.\n'
+printf 'Model: %s\n' "$VIGIL_MODEL"
 
-printf '[6/6] Complete.\n'
+printf '\nInstalled models:\n'
+ollama list || true
+
+printf '\nAgent launcher:\n'
 /opt/vigil/bin/vigil-agent --help || true
 BOOTEOF
 
 chmod +x /usr/local/bin/vigil-bootstrap
 
-cat >/etc/motd <<'EOF2'
+
+# ============================================================
+# MOTD
+# ============================================================
+
+cat >/etc/motd <<'EOF'
 VIGIL private LLM host
 
-Bootstrap after uploading the offline bundle:
+Initial bootstrap:
   sudo /usr/local/bin/vigil-bootstrap
 
+Update Agent / Tools only:
+  sudo /usr/local/bin/vigil-update-app
+
 Run:
-  cd /opt/vigil/repo
-  /opt/vigil/bin/vigil-agent "この環境の閉域性を調査してください"
-EOF2
+  /opt/vigil/bin/vigil-agent \
+    --workspace /opt/vigil/repo/infra \
+    "この環境の閉域性を調査してください"
+EOF
