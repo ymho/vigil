@@ -1,6 +1,7 @@
 import socket
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -17,35 +18,63 @@ class TestWorkspace(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_workspace_exists(self):
-        workspace = Workspace(str(self.root))
+        workspace = Workspace(
+            str(self.root)
+        )
 
         self.assertEqual(
             workspace.root,
             self.root.resolve(),
         )
 
-    def test_resolve_inside_workspace(self):
-        workspace = Workspace(str(self.root))
+    def test_workspace_must_be_directory(self):
+        file = self.root / "x.txt"
+        file.write_text(
+            "x",
+            encoding="utf-8",
+        )
 
-        result = workspace.resolve("network.tf")
+        with self.assertRaises(ValueError):
+            Workspace(str(file))
+
+    def test_resolve_inside_workspace(self):
+        workspace = Workspace(
+            str(self.root)
+        )
+
+        target = workspace.resolve(
+            "network.tf"
+        )
 
         self.assertEqual(
-            result,
-            (self.root / "network.tf").resolve(),
+            target,
+            (
+                self.root
+                / "network.tf"
+            ).resolve(),
         )
 
     def test_resolve_outside_workspace_denied(self):
-        workspace = Workspace(str(self.root))
+        workspace = Workspace(
+            str(self.root)
+        )
 
         with self.assertRaises(ValueError):
-            workspace.resolve("../secret.txt")
+            workspace.resolve(
+                "../secret.txt"
+            )
 
 
 class TestTools(unittest.TestCase):
 
     def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.root = Path(self.tempdir.name)
+        self.tempdir = (
+            tempfile.TemporaryDirectory()
+        )
+
+        self.root = Path(
+            self.tempdir.name
+        )
 
         (self.root / "network.tf").write_text(
             """
@@ -69,10 +98,19 @@ resource "aws_instance" "agent" {
             encoding="utf-8",
         )
 
-        subdir = self.root / "docs"
-        subdir.mkdir()
+        (self.root / "endpoints.tf").write_text(
+            """
+resource "aws_vpc_endpoint" "s3" {
+  vpc_endpoint_type = "Gateway"
+}
+""".strip(),
+            encoding="utf-8",
+        )
 
-        (subdir / "README.md").write_text(
+        docs = self.root / "docs"
+        docs.mkdir()
+
+        (docs / "README.md").write_text(
             "VIGIL documentation",
             encoding="utf-8",
         )
@@ -88,12 +126,14 @@ resource "aws_instance" "agent" {
     def tearDown(self):
         self.tempdir.cleanup()
 
-    # --------------------------------------------------------
+    # ========================================================
     # Files
-    # --------------------------------------------------------
+    # ========================================================
 
     def test_list_files(self):
-        result = self.tools.list_files("*.tf")
+        result = self.tools.list_files(
+            "*.tf"
+        )
 
         self.assertIn(
             "network.tf",
@@ -105,8 +145,15 @@ resource "aws_instance" "agent" {
             result,
         )
 
+        self.assertIn(
+            "endpoints.tf",
+            result,
+        )
+
     def test_list_files_no_match(self):
-        result = self.tools.list_files("*.xyz")
+        result = self.tools.list_files(
+            "*.xyz"
+        )
 
         self.assertEqual(
             result,
@@ -114,7 +161,9 @@ resource "aws_instance" "agent" {
         )
 
     def test_list_directory(self):
-        result = self.tools.list_directory(".")
+        result = (
+            self.tools.list_directory(".")
+        )
 
         self.assertIn(
             "docs/",
@@ -123,6 +172,18 @@ resource "aws_instance" "agent" {
 
         self.assertIn(
             "network.tf",
+            result,
+        )
+
+    def test_list_directory_missing(self):
+        result = (
+            self.tools.list_directory(
+                "missing"
+            )
+        )
+
+        self.assertIn(
+            "Path not found",
             result,
         )
 
@@ -136,7 +197,12 @@ resource "aws_instance" "agent" {
             result,
         )
 
-    def test_read_file_lines(self):
+        self.assertIn(
+            "1:",
+            result,
+        )
+
+    def test_read_file_line_range(self):
         result = self.tools.read_file(
             "network.tf",
             start_line=1,
@@ -148,13 +214,28 @@ resource "aws_instance" "agent" {
             result,
         )
 
+        self.assertIn(
+            "2:",
+            result,
+        )
+
+    def test_read_file_missing(self):
+        result = self.tools.read_file(
+            "missing.txt"
+        )
+
+        self.assertEqual(
+            result,
+            "File not found: missing.txt",
+        )
+
     def test_read_outside_workspace_denied(self):
         with self.assertRaises(ValueError):
             self.tools.read_file(
                 "../secret"
             )
 
-    def test_search_text_regex(self):
+    def test_search_text_regex_or(self):
         result = self.tools.search_text(
             "aws_vpc|aws_route_table",
             "*.tf",
@@ -177,7 +258,19 @@ resource "aws_instance" "agent" {
             result,
         )
 
-    def test_search_invalid_regex(self):
+    def test_search_text_no_match(self):
+        result = self.tools.search_text(
+            "internet_gateway",
+            "*.tf",
+            regex=False,
+        )
+
+        self.assertEqual(
+            result,
+            "0 matches",
+        )
+
+    def test_search_text_invalid_regex(self):
         result = self.tools.search_text(
             "[invalid",
             "*.tf",
@@ -198,19 +291,37 @@ resource "aws_instance" "agent" {
             result,
         )
 
-    def test_hash_file(self):
+        self.assertIn(
+            '"size_bytes"',
+            result,
+        )
+
+    def test_hash_file_sha256(self):
         result = self.tools.hash_file(
             "network.tf",
             "sha256",
         )
 
         self.assertTrue(
-            result.startswith("sha256=")
+            result.startswith(
+                "sha256="
+            )
         )
 
-    # --------------------------------------------------------
+    def test_hash_file_invalid_algorithm(self):
+        result = self.tools.hash_file(
+            "network.tf",
+            "foo",
+        )
+
+        self.assertIn(
+            "unsupported algorithm",
+            result,
+        )
+
+    # ========================================================
     # DNS
-    # --------------------------------------------------------
+    # ========================================================
 
     @patch("socket.getaddrinfo")
     def test_resolve_dns(
@@ -231,14 +342,44 @@ resource "aws_instance" "agent" {
             "example.local"
         )
 
-        self.assertEqual(
+        self.assertIn(
+            "status=RESOLVED",
             result,
-            "10.0.0.1",
         )
 
-    # --------------------------------------------------------
+        self.assertIn(
+            "10.0.0.1",
+            result,
+        )
+
+        self.assertIn(
+            "does not establish",
+            result,
+        )
+
+    @patch("socket.getaddrinfo")
+    def test_resolve_dns_failure(
+        self,
+        getaddrinfo,
+    ):
+        getaddrinfo.side_effect = (
+            socket.gaierror(
+                "not found"
+            )
+        )
+
+        result = self.tools.resolve_dns(
+            "invalid"
+        )
+
+        self.assertIn(
+            "status=ERROR",
+            result,
+        )
+
+    # ========================================================
     # TCP
-    # --------------------------------------------------------
+    # ========================================================
 
     @patch("socket.create_connection")
     def test_check_tcp_connected(
@@ -310,9 +451,9 @@ resource "aws_instance" "agent" {
             result,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # HTTP
-    # --------------------------------------------------------
+    # ========================================================
 
     def test_http_invalid_scheme(self):
         result = self.tools.http_request(
@@ -324,27 +465,71 @@ resource "aws_instance" "agent" {
             result,
         )
 
-    # --------------------------------------------------------
-    # Programs
-    # --------------------------------------------------------
+    def test_http_invalid_method(self):
+        result = self.tools.http_request(
+            "https://example.com",
+            method="POST",
+        )
+
+        self.assertIn(
+            "only HEAD and GET",
+            result,
+        )
+
+    # ========================================================
+    # Linux OS observations
+    # ========================================================
 
     @patch("subprocess.run")
-    def test_get_routes(
+    def test_get_os_routes(
         self,
         run,
     ):
         run.return_value = Mock(
             returncode=0,
             stdout=(
-                "10.40.0.0/16 dev eth0\n"
+                "default via 10.40.1.1 "
+                "dev enp39s0\n"
             ),
             stderr="",
         )
 
-        result = self.tools.get_routes()
+        result = (
+            self.tools.get_os_routes()
+        )
 
         self.assertIn(
-            "10.40.0.0/16",
+            "scope=LINUX_OS_ROUTING_TABLE",
+            result,
+        )
+
+        self.assertIn(
+            "default via 10.40.1.1",
+            result,
+        )
+
+        self.assertIn(
+            "does not directly describe",
+            result,
+        )
+
+    @patch("subprocess.run")
+    def test_get_os_rules(
+        self,
+        run,
+    ):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "0: from all lookup local\n"
+            ),
+            stderr="",
+        )
+
+        result = self.tools.get_os_rules()
+
+        self.assertIn(
+            "LINUX_OS_POLICY_ROUTING",
             result,
         )
 
@@ -356,7 +541,8 @@ resource "aws_instance" "agent" {
         run.return_value = Mock(
             returncode=0,
             stdout=(
-                "eth0 UP 10.40.1.10/24\n"
+                "enp39s0 UP "
+                "10.40.1.106/24\n"
             ),
             stderr="",
         )
@@ -366,7 +552,36 @@ resource "aws_instance" "agent" {
         )
 
         self.assertIn(
-            "eth0",
+            "enp39s0",
+            result,
+        )
+
+        self.assertIn(
+            "LINUX_OS_INTERFACES",
+            result,
+        )
+
+    @patch("subprocess.run")
+    def test_get_neighbor_table(
+        self,
+        run,
+    ):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "10.40.1.1 dev enp39s0 "
+                "lladdr 00:00:00:00:00:01 "
+                "REACHABLE"
+            ),
+            stderr="",
+        )
+
+        result = (
+            self.tools.get_neighbor_table()
+        )
+
+        self.assertIn(
+            "LINUX_OS_NEIGHBOR_TABLE",
             result,
         )
 
@@ -378,7 +593,8 @@ resource "aws_instance" "agent" {
         run.return_value = Mock(
             returncode=0,
             stdout=(
-                "LISTEN 127.0.0.1:11434"
+                "LISTEN 0 4096 "
+                "127.0.0.1:11434"
             ),
             stderr="",
         )
@@ -392,41 +608,182 @@ resource "aws_instance" "agent" {
             result,
         )
 
+    # ========================================================
+    # System
+    # ========================================================
+
+    @patch("socket.gethostname")
+    def test_get_hostname(
+        self,
+        gethostname,
+    ):
+        gethostname.return_value = (
+            "vigil-test"
+        )
+
+        result = self.tools.get_hostname()
+
+        self.assertIn(
+            "vigil-test",
+            result,
+        )
+
+    def test_get_system_info(self):
+        result = (
+            self.tools.get_system_info()
+        )
+
+        self.assertIn(
+            '"scope": "LOCAL_SYSTEM"',
+            result,
+        )
+
+        self.assertIn(
+            '"python"',
+            result,
+        )
+
+    # ========================================================
+    # Terraform
+    # ========================================================
+
     @patch("subprocess.run")
-    def test_run_program_allowed(
+    def test_terraform_validate(
         self,
         run,
     ):
         run.return_value = Mock(
             returncode=0,
-            stdout="Linux",
+            stdout=(
+                "Success! The configuration "
+                "is valid."
+            ),
             stderr="",
         )
 
-        result = self.tools.run_program(
-            "uname",
-            ["-s"],
+        result = (
+            self.tools.terraform_validate()
         )
 
         self.assertIn(
-            "Linux",
+            "exit_code=0",
             result,
-        )
-
-    def test_run_program_denied(self):
-        result = self.tools.run_program(
-            "bash",
-            ["-c", "whoami"],
         )
 
         self.assertIn(
-            "program not allowed",
+            "configuration is valid",
             result,
         )
 
-    # --------------------------------------------------------
+    @patch("subprocess.run")
+    def test_terraform_state_list(
+        self,
+        run,
+    ):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "aws_vpc.vigil\n"
+                "aws_instance.agent\n"
+            ),
+            stderr="",
+        )
+
+        result = (
+            self.tools.terraform_state_list()
+        )
+
+        self.assertIn(
+            "aws_vpc.vigil",
+            result,
+        )
+
+    @patch("subprocess.run")
+    def test_terraform_state_show(
+        self,
+        run,
+    ):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=(
+                "# aws_vpc.vigil:\n"
+                "resource \"aws_vpc\" \"vigil\" {}"
+            ),
+            stderr="",
+        )
+
+        result = (
+            self.tools.terraform_state_show(
+                "aws_vpc.vigil"
+            )
+        )
+
+        self.assertIn(
+            "aws_vpc",
+            result,
+        )
+
+    def test_terraform_state_show_rejects_bad_address(
+        self,
+    ):
+        result = (
+            self.tools.terraform_state_show(
+                "aws_vpc.vigil; rm -rf /"
+            )
+        )
+
+        self.assertIn(
+            "invalid Terraform resource address",
+            result,
+        )
+
+    # ========================================================
+    # Internal runner
+    # ========================================================
+
+    @patch("subprocess.run")
+    def test_run_readonly_timeout(
+        self,
+        run,
+    ):
+        run.side_effect = (
+            subprocess.TimeoutExpired(
+                cmd=["ip"],
+                timeout=5,
+            )
+        )
+
+        result = self.tools._run_readonly(
+            ["ip", "route"],
+            timeout=5,
+        )
+
+        self.assertIn(
+            "status=TIMEOUT",
+            result,
+        )
+
+    @patch("subprocess.run")
+    def test_run_readonly_not_found(
+        self,
+        run,
+    ):
+        run.side_effect = (
+            FileNotFoundError()
+        )
+
+        result = self.tools._run_readonly(
+            ["missing-program"]
+        )
+
+        self.assertIn(
+            "status=NOT_FOUND",
+            result,
+        )
+
+    # ========================================================
     # Registry
-    # --------------------------------------------------------
+    # ========================================================
 
     def test_registry(self):
         registry = self.tools.registry()
@@ -441,10 +798,16 @@ resource "aws_instance" "agent" {
             "resolve_dns",
             "check_tcp",
             "http_request",
-            "get_routes",
+            "get_os_routes",
+            "get_os_rules",
             "get_interfaces",
+            "get_neighbor_table",
             "get_listening_ports",
-            "run_program",
+            "get_hostname",
+            "get_system_info",
+            "terraform_validate",
+            "terraform_state_list",
+            "terraform_state_show",
         }
 
         self.assertEqual(
