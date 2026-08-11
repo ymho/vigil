@@ -15,11 +15,15 @@ cat >/usr/local/bin/vigil-bootstrap <<'BOOTEOF'
 set -euo pipefail
 source /etc/vigil.env
 
-BUNDLE=/tmp/vigil-bundle.tar.gz
-STAGE=/tmp/vigil-stage
+WORK_DIR=/opt/vigil/bootstrap
+BUNDLE="$WORK_DIR/vigil-bundle.tar.gz"
+STAGE="$WORK_DIR/stage"
 
-rm -rf "$STAGE"
-mkdir -p "$STAGE" /opt/vigil/repo /var/lib/vigil/ollama-models
+rm -rf "$WORK_DIR"
+mkdir -p \
+  "$STAGE" \
+  /opt/vigil/repo \
+  /var/lib/vigil/ollama-models
 
 printf '[1/6] Downloading offline bundle from S3...\n'
 aws s3 cp "s3://$VIGIL_BUCKET/$VIGIL_BUNDLE_KEY" "$BUNDLE"
@@ -87,6 +91,11 @@ cd /opt/vigil/repo
 exec /usr/bin/python3 agent/agent.py --model "$VIGIL_MODEL" "$@"
 LAUNCHEOF
 chmod +x /opt/vigil/bin/vigil-agent
+
+printf '[6/6] Cleaning bootstrap files...\n'
+rm -rf "$WORK_DIR"
+
+printf 'Complete.\n'
 
 printf '[6/6] Complete.\n'
 /opt/vigil/bin/vigil-agent --help || true
